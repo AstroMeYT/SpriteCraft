@@ -1,5 +1,9 @@
+<img src="./assets/spritecraft.png" alt="Logo" width="100">
+
 # SpriteCraft 0.2.0
 2D pixel art & animation studio in Rust (egui). Adobe-style layout: title bar with menus, options bar, toolbox, project tabs, canvas with rulers, Preview/Color/Swatches/Layers panels, and a bottom Timeline.
+
+<img src="./screenshots/main-full.png" alt="Screenshot 1" width="800">
 
 ## Install
     ./install.sh              # user install to ~/.local (installs deps + Rust automatically)
