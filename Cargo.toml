@@ -1,6 +1,6 @@
 [package]
 name = "spritecraft"
-version = "0.2.0-r2021"
+version = "0.3.0"
 edition = "2021"
 description = "SpriteCraft - 2D pixel art and animation studio"
 license = "MIT"

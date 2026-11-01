@@ -1,7 +1,7 @@
 name: Release
 
-# Pushing a tag like v0.2.0 builds every package and publishes a GitHub release.
-#   git tag v0.2.0 && git push origin v0.2.0
+# Pushing a tag like v0.3.0 builds every package and publishes a GitHub release.
+#   git tag v0.3.0 && git push origin v0.3.0
 on:
   push:
     tags: ['v*']

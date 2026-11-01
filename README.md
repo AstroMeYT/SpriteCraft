@@ -1,4 +1,4 @@
-# SpriteCraft 0.2.0
+# SpriteCraft 0.3.0
 2D pixel art & animation studio in Rust (egui). Adobe-style layout: title bar with menus, options bar, toolbox, project tabs, canvas with rulers, Preview/Color/Swatches/Layers panels, and a bottom Timeline.
 
 ## Install
@@ -34,7 +34,7 @@ horizontal strips, CSS/HTML snippet).
 ## Releases
 Pushing a tag builds and publishes every package automatically (`.github/workflows/release.yml`):
 
-    git tag v0.2.0 && git push origin v0.2.0
+    git tag v0.3.0 && git push origin v0.3.0
 
 The tag must match `version` in `Cargo.toml`. Artifacts: deb, rpm, AppImage, Flatpak, Windows exe + msi, macOS dmg (Intel and Apple Silicon) and `SHA256SUMS`.
 `.github/workflows/ci.yml` runs the tests on every push and pull request.
