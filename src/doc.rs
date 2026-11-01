@@ -15,6 +15,22 @@ pub struct Layer {
     pub opacity: f32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TagDir {
+    Forward,
+    Reverse,
+    PingPong,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Tag {
+    pub name: String,
+    pub from: usize,
+    pub to: usize,
+    pub dir: TagDir,
+    pub color: [u8; 3],
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Doc {
     pub w: usize,
@@ -24,6 +40,10 @@ pub struct Doc {
     pub frames: Vec<Vec<Cel>>,
     pub holds: Vec<u32>,
     pub fps: u32,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 pub fn over(dst: Px, src: Px, op: f32) -> Px {
@@ -54,7 +74,58 @@ impl Doc {
             frames: vec![vec![Arc::new(vec![CLEAR; w * h])]],
             holds: vec![1],
             fps: 8,
+            tags: vec![],
+            names: vec![String::new()],
         }
+    }
+
+    /// Repairs optional fields after loading older files.
+    pub fn fix(&mut self) {
+        self.names.resize(self.frames.len(), String::new());
+        self.holds.resize(self.frames.len(), 1);
+        let last = self.frames.len() - 1;
+        for t in &mut self.tags {
+            t.from = t.from.min(last);
+            t.to = t.to.min(last).max(t.from);
+        }
+    }
+
+    pub fn tag_sequence(&self, t: &Tag) -> Vec<usize> {
+        let fwd: Vec<usize> = (t.from..=t.to.min(self.frames.len() - 1)).collect();
+        match t.dir {
+            TagDir::Forward => fwd,
+            TagDir::Reverse => fwd.into_iter().rev().collect(),
+            TagDir::PingPong => {
+                let mut v = fwd.clone();
+                if fwd.len() > 2 {
+                    v.extend(fwd[1..fwd.len() - 1].iter().rev());
+                }
+                v
+            }
+        }
+    }
+
+    fn tags_insert(&mut self, at: usize) {
+        for t in &mut self.tags {
+            if t.from >= at {
+                t.from += 1;
+            }
+            if t.to >= at {
+                t.to += 1;
+            }
+        }
+    }
+
+    fn tags_remove(&mut self, at: usize) {
+        for t in &mut self.tags {
+            if t.from > at {
+                t.from -= 1;
+            }
+            if t.to >= at && t.to > 0 {
+                t.to -= 1;
+            }
+        }
+        self.tags.retain(|t| t.to >= t.from);
     }
 
     pub fn blank(&self) -> Cel {
@@ -156,6 +227,8 @@ impl Doc {
         let fr: Vec<Cel> = (0..self.layers.len()).map(|_| self.blank()).collect();
         self.frames.insert(after + 1, fr);
         self.holds.insert(after + 1, 1);
+        self.names.insert(after + 1, String::new());
+        self.tags_insert(after + 1);
         after + 1
     }
 
@@ -164,6 +237,9 @@ impl Doc {
         let hold = self.holds[f];
         self.frames.insert(f + 1, fr);
         self.holds.insert(f + 1, hold);
+        let nm = self.names[f].clone();
+        self.names.insert(f + 1, nm);
+        self.tags_insert(f + 1);
         f + 1
     }
 
@@ -173,6 +249,8 @@ impl Doc {
         }
         self.frames.remove(f);
         self.holds.remove(f);
+        self.names.remove(f);
+        self.tags_remove(f);
     }
 
     pub fn move_frame(&mut self, f: usize, right: bool) -> usize {
@@ -182,12 +260,20 @@ impl Doc {
         }
         self.frames.swap(f, t);
         self.holds.swap(f, t);
+        self.names.swap(f, t);
         t
     }
 
     pub fn reverse_frames(&mut self) {
         self.frames.reverse();
         self.holds.reverse();
+        self.names.reverse();
+        let n = self.frames.len();
+        for t in &mut self.tags {
+            let (a, b) = (n - 1 - t.to, n - 1 - t.from);
+            t.from = a;
+            t.to = b;
+        }
     }
 
     pub fn pingpong(&mut self) {
@@ -198,8 +284,10 @@ impl Doc {
         for i in (1..n - 1).rev() {
             let fr = self.frames[i].clone();
             let h = self.holds[i];
+            let nm = self.names[i].clone();
             self.frames.push(fr);
             self.holds.push(h);
+            self.names.push(nm);
         }
     }
 
@@ -616,5 +704,21 @@ mod tests {
         assert!(buf[0][3] == 0);
         draw_shape(&mut buf, &c, Shape::Line, (0, 0), (31, 31), false, [1, 1, 1, 255], false);
         assert_eq!(buf[31 * 32 + 31], [1, 1, 1, 255]);
+    }
+
+    #[test]
+    fn tags_follow_frame_edits() {
+        let mut d = Doc::new(2, 2);
+        d.add_frame(0);
+        d.add_frame(1);
+        d.add_frame(2); // 4 frames
+        d.tags.push(Tag { name: "a".into(), from: 1, to: 2, dir: TagDir::Forward, color: [0; 3] });
+        d.add_frame(0); // inserted before the tag -> tag shifts right
+        assert_eq!((d.tags[0].from, d.tags[0].to), (2, 3));
+        d.delete_frame(0);
+        assert_eq!((d.tags[0].from, d.tags[0].to), (1, 2));
+        assert_eq!(d.names.len(), d.frames.len());
+        let seq = d.tag_sequence(&Tag { name: "p".into(), from: 0, to: 3, dir: TagDir::PingPong, color: [0; 3] });
+        assert_eq!(seq, vec![0, 1, 2, 3, 2, 1]);
     }
 }

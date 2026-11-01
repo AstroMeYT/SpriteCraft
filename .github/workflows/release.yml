@@ -1,0 +1,86 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds every package and publishes a GitHub release.
+#   git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the version in Cargo.toml
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version v$V"; exit 1
+          fi
+
+  linux:
+    # Linux packages plus the cross-built Windows exe and msi
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build deb, rpm, AppImage, exe and msi
+        run: ./install.sh --package deb,rpm,appimage,exe,msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-windows
+          path: dist/*
+          if-no-files-found: error
+
+  flatpak:
+    needs: check
+    runs-on: ubuntu-22.04
+    continue-on-error: true   # Flatpak builds download a large SDK; do not block the release if it fails
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Flatpak bundle
+        run: ./install.sh --package flatpak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: dist/*.flatpak
+          if-no-files-found: error
+
+  macos:
+    needs: check
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]   # Intel and Apple Silicon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build dmg
+        run: ./install.sh --package dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.os }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [linux, flatpak, macos]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

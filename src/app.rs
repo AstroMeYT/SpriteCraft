@@ -9,8 +9,10 @@ fn plot_ctx<'a>(w: usize, h: usize, size: i32, round: bool, dither: bool, sx: bo
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> App {
-        apply_theme(&cc.egui_ctx);
+        let config = config::Config::load();
+        apply_theme(&cc.egui_ctx, config.light);
         let doc = Doc::new(64, 64);
+        let session = format!("{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), std::process::id());
         App {
             doc,
             undo: vec![],
@@ -77,18 +79,35 @@ impl App {
             text_cache: None,
             text_font: None,
             text_tex: None,
+            th: Theme::new(config.light),
+            config,
+            show_home: true,
+            new_w: 64,
+            new_h: 64,
+            project_colors: vec![],
+            colors_dirty: true,
+            play_tag: None,
+            play_pos: 0,
+            session,
+            last_autosave: 0.0,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            quit_ok: false,
         }
     }
 
     pub fn changed(&mut self) {
         self.dirty = true;
         self.modified = true;
+        self.colors_dirty = true;
     }
 
     pub fn changed_all(&mut self) {
         self.dirty = true;
         self.dirty_all = true;
         self.modified = true;
+        self.colors_dirty = true;
     }
 
     pub fn clamp_indices(&mut self) {
@@ -227,6 +246,10 @@ impl App {
                 st.sel_base = if self.shift { self.selection.clone() } else { None };
                 self.update_select(&st, p);
             }
+            Tool::Lasso => {
+                st.sel_base = if self.shift { self.selection.clone() } else { None };
+                self.update_lasso(&st.pts.clone(), &st.sel_base.clone());
+            }
             Tool::Wand => {
                 let m = flood_mask(&self.doc.frames[f][l], w, h, p.0, p.1, self.tolerance, self.global_fill);
                 let prev = self.selection.clone();
@@ -330,6 +353,12 @@ impl App {
                 self.redraw_shape(&st, p);
             }
             Tool::Select => self.update_select(&st, p),
+            Tool::Lasso => {
+                if !same {
+                    st.pts.push(p);
+                    self.update_lasso(&st.pts.clone(), &st.sel_base.clone());
+                }
+            }
             Tool::Move => {
                 let (dx, dy) = (p.0 - st.start.0, p.1 - st.start.1);
                 let cel = Arc::make_mut(&mut self.doc.frames[f][l]);
@@ -364,6 +393,9 @@ impl App {
     pub fn end_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
             if st.tool == Tool::Select && st.start == st.last && !self.shift {
+                self.selection = None;
+            }
+            if st.tool == Tool::Lasso && st.pts.len() < 3 && !self.shift {
                 self.selection = None;
             }
             self.changed();
@@ -623,24 +655,6 @@ impl App {
         });
     }
 
-    pub fn filter_outline(&mut self, all: bool) {
-        let col = px_of(self.color);
-        self.apply_filter(all, move |b, w, h| {
-            let src = b.clone();
-            for y in 0..h {
-                for x in 0..w {
-                    if src[y * w + x][3] != 0 {
-                        continue;
-                    }
-                    let n = [(x as i32 - 1, y as i32), (x as i32 + 1, y as i32), (x as i32, y as i32 - 1), (x as i32, y as i32 + 1)];
-                    if n.iter().any(|&(nx, ny)| nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h && src[ny as usize * w + nx as usize][3] != 0) {
-                        b[y * w + x] = col;
-                    }
-                }
-            }
-        });
-    }
-
     pub fn filter_replace(&mut self, all: bool) {
         let (from, to) = (px_of(self.color), px_of(self.color2));
         self.apply_filter(all, move |b, _, _| {
@@ -697,6 +711,8 @@ impl App {
         self.path = Some(path.to_path_buf());
         self.modified = false;
         self.status = format!("Saved {}", path.display());
+        self.config.add_recent(path);
+        self.colors_dirty = true;
         Ok(())
     }
 
@@ -712,6 +728,8 @@ impl App {
             return Err("Corrupt project".into());
         }
         self.prepare_tab();
+        let mut doc = doc;
+        doc.fix();
         self.doc = doc;
         self.undo.clear();
         self.redo.clear();
@@ -723,6 +741,9 @@ impl App {
         self.changed_all();
         self.modified = false;
         self.status = format!("Opened {}", path.display());
+        self.config.add_recent(path);
+        self.show_home = false;
+        self.colors_dirty = true;
         Ok(())
     }
 
@@ -743,6 +764,7 @@ impl App {
             }
         }
         self.changed_all();
+        self.show_home = false;
         self.status = format!("Imported {}", path.display());
         Ok(())
     }
@@ -796,13 +818,14 @@ impl App {
                 }
                 Ok(p.display().to_string())
             }
-            _ => {
+            3 => {
                 for i in 0..n {
                     let img = scaled_image(&self.doc.composite(i), w, h, s);
                     img.save(path_join(&st.dir, &format!("{stem}_{:03}.png", i + 1))).map_err(|e| e.to_string())?;
                 }
                 Ok(format!("{} ({} files)", st.dir, n))
             }
+            _ => export::export_game(&self.doc, st.kind, &export::Opts { dir: &st.dir, name: &st.name, scale: s, cols: st.cols }),
         }
     }
 
@@ -844,6 +867,7 @@ impl App {
         self.thumbs.clear();
         self.dirty = true;
         self.dirty_all = true;
+        self.colors_dirty = true;
         self.clamp_indices();
     }
 
@@ -869,6 +893,7 @@ impl App {
         self.path = None;
         self.new_doc(w, h);
         self.thumbs.clear();
+        self.show_home = false;
     }
 
     /// Opening a file reuses the current tab only if it is still a pristine, untouched document.
@@ -884,6 +909,7 @@ impl App {
             self.modified = false;
             self.path = None;
             self.new_doc(64, 64);
+            self.show_home = true;
             return;
         }
         self.tabs.remove(idx);

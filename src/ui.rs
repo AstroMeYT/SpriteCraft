@@ -16,29 +16,55 @@ fn mi(ui: &mut Ui, label: &str, sc: &str) -> bool {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.shift = ctx.input(|i| i.modifiers.shift);
+        let now = ctx.input(|i| i.time);
+        if self.last_autosave == 0.0 {
+            self.last_autosave = now.max(0.001);
+            self.startup();
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.any_modified() && !self.quit_ok {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Dialog::ConfirmQuit;
+        }
         self.shortcuts(ctx);
         self.tick_playback(ctx);
         self.refresh_textures(ctx);
         self.menu_bar(ctx);
-        self.options_bar(ctx);
+        let home = self.show_home;
+        if !home {
+            self.options_bar(ctx);
+        }
         self.status_bar(ctx);
-        self.toolbox(ctx);
-        self.right_panel(ctx);
-        self.timeline(ctx);
-        self.canvas_panel(ctx);
+        if home {
+            self.start_page(ctx);
+        } else {
+            self.toolbox(ctx);
+            self.right_panel(ctx);
+            self.timeline(ctx);
+            self.canvas_panel(ctx);
+        }
         self.dialogs(ctx);
+        self.command_palette(ctx);
+        self.handle_drops(ctx);
         self.window_chrome(ctx);
+        self.autosave(now);
+        ctx.request_repaint_after(std::time::Duration::from_secs(30));
         if self.dirty || self.dirty_all {
             ctx.request_repaint();
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = std::fs::remove_dir_all(config::session_dir(&self.session));
     }
 }
 
 impl App {
     // ------------------------------------------------------------ housekeeping
-    fn toggle_play(&mut self, ctx: &egui::Context) {
+    pub fn toggle_play(&mut self, ctx: &egui::Context) {
         self.playing = !self.playing;
-        self.play_frame = self.cur_frame;
+        let seq = self.playback_seq();
+        self.play_pos = seq.iter().position(|&f| f == self.cur_frame).unwrap_or(0);
+        self.play_frame = seq[self.play_pos];
         self.play_last = ctx.input(|i| i.time);
     }
 
@@ -47,11 +73,13 @@ impl App {
             return;
         }
         let now = ctx.input(|i| i.time);
-        let n = self.doc.frames.len();
-        self.play_frame = self.play_frame.min(n - 1);
+        let seq = self.playback_seq();
+        self.play_pos = self.play_pos.min(seq.len() - 1);
+        self.play_frame = seq[self.play_pos];
         let dur = self.doc.holds[self.play_frame].max(1) as f64 / self.doc.fps.max(1) as f64;
         if now - self.play_last >= dur {
-            self.play_frame = (self.play_frame + 1) % n;
+            self.play_pos = (self.play_pos + 1) % seq.len();
+            self.play_frame = seq[self.play_pos];
             self.play_last = now;
         }
         ctx.request_repaint();
@@ -165,6 +193,11 @@ impl App {
         if k(Modifiers::COMMAND, Key::E) {
             self.open_export();
         }
+        if k(Modifiers::COMMAND, Key::K) || k(cs, Key::P) {
+            self.palette_open = true;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
         if k(Modifiers::COMMAND, Key::W) {
             self.request_close(self.active);
         }
@@ -178,7 +211,7 @@ impl App {
         for (t, _, key) in TOOLS {
             let kk = match *key {
                 "B" => Key::B, "E" => Key::E, "G" => Key::G, "I" => Key::I, "L" => Key::L, "R" => Key::R, "O" => Key::O,
-                "M" => Key::M, "W" => Key::W, "V" => Key::V, "D" => Key::D, "A" => Key::A, "T" => Key::T, _ => Key::H,
+                "M" => Key::M, "W" => Key::W, "V" => Key::V, "D" => Key::D, "A" => Key::A, "T" => Key::T, "Q" => Key::Q, _ => Key::H,
             };
             if pressed(kk) {
                 self.tool = *t;
@@ -216,11 +249,11 @@ impl App {
         }
     }
 
-    fn open_open(&mut self) {
+    pub fn open_open(&mut self) {
         self.dialog = Dialog::Open(FileBrowser { dir: projects_dir(), name: String::new(), exts: vec![".spc"] });
     }
 
-    fn open_save_as(&mut self) {
+    pub fn open_save_as(&mut self) {
         let (dir, name) = match &self.path {
             Some(p) => (p.parent().map(|d| d.to_path_buf()).unwrap_or_else(projects_dir), p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
             None => (projects_dir(), "sprite.spc".to_string()),
@@ -228,7 +261,7 @@ impl App {
         self.dialog = Dialog::Save(FileBrowser { dir, name, exts: vec![".spc"] });
     }
 
-    fn open_export(&mut self) {
+    pub fn open_export(&mut self) {
         let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "sprite".into());
         let dir = projects_dir().join("exports").to_string_lossy().to_string();
         self.dialog = Dialog::Export(ExportState { dir, name: stem, kind: 0, scale: 4, cols: 8, json: true });
@@ -236,7 +269,7 @@ impl App {
 
     // ------------------------------------------------------------ menu bar
     fn menu_bar(&mut self, ctx: &egui::Context) {
-        let frame = Frame::none().fill(Color32::from_rgb(31, 31, 33)).inner_margin(egui::Margin::symmetric(6.0, 0.0));
+        let frame = Frame::none().fill(self.th.title).inner_margin(egui::Margin::symmetric(6.0, 0.0));
         egui::TopBottomPanel::top("menu").frame(frame).exact_height(32.0).show(ctx, |ui| {
             ui.spacing_mut().interact_size.y = 32.0;
             ui.spacing_mut().button_padding = vec2(9.0, 6.0);
@@ -271,6 +304,22 @@ impl App {
                     if mi(ui, "Close Tab", "Ctrl+W") {
                         self.request_close(self.active);
                     }
+                    if mi(ui, "Start Page", "") {
+                        self.show_home = true;
+                    }
+                    ui.menu_button("Open Recent", |ui| {
+                        if self.config.recent.is_empty() {
+                            ui.label("No recent files");
+                        }
+                        for r in self.config.recent.clone() {
+                            let p = PathBuf::from(&r);
+                            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(r.clone());
+                            if ui.button(name).on_hover_text(&r).clicked() {
+                                self.open_path(&p);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
                     if mi(ui, "Import PNG...", "") {
                         self.dialog = Dialog::Import { fb: FileBrowser { dir: home_dir(), name: String::new(), exts: vec![".png"] }, resize: true };
@@ -316,6 +365,14 @@ impl App {
                     if mi(ui, "Select Opaque Pixels", "") {
                         self.select_opaque();
                     }
+                    if mi(ui, "Select Same Color as Primary", "") {
+                        let (c, t) = (px_of(self.color), self.tolerance);
+                        self.select_color(c, t, false);
+                    }
+                    if mi(ui, "Command Palette...", "Ctrl+K") {
+                        self.palette_open = true;
+                        self.palette_query.clear();
+                    }
                 });
                 ui.menu_button("Image", |ui| {
                     if mi(ui, "Canvas Size / Scale...", "") {
@@ -336,6 +393,9 @@ impl App {
                     }
                     if mi(ui, "Rotate 90 CCW", "") {
                         self.rotate_canvas(false);
+                    }
+                    if mi(ui, "Rotate Layer (RotSprite)...", "") {
+                        self.dialog = Dialog::RotSprite { angle: 15.0, all: false };
                     }
                     ui.separator();
                     if mi(ui, "Flip Layer Horizontal", "") {
@@ -387,6 +447,16 @@ impl App {
                         self.frame_pingpong();
                     }
                     ui.separator();
+                    if mi(ui, "Rename Frame...", "") {
+                        self.dialog = Dialog::RenameFrame(self.doc.names[self.cur_frame].clone());
+                    }
+                    if mi(ui, "New Tag...", "") {
+                        self.dialog = start::dlg_new_tag(self);
+                    }
+                    if mi(ui, "Play All Frames (ignore tags)", "") {
+                        self.play_tag = None;
+                    }
+                    ui.separator();
                     if mi(ui, "Play / Stop", "Enter") {
                         let c = ui.ctx().clone();
                         self.toggle_play(&c);
@@ -409,8 +479,11 @@ impl App {
                     if mi(ui, "Hue / Saturation / Value...", "") {
                         self.dialog = Dialog::Adjust { hue: 0.0, sat: 0.0, val: 0.0, all: false };
                     }
-                    if mi(ui, "Outline (primary color)", "") {
-                        self.filter_outline(false);
+                    if mi(ui, "Outline, Shadow & Shading...", "") {
+                        self.dialog = start::dlg_effects();
+                    }
+                    if mi(ui, "Replace Color (tolerance)...", "") {
+                        self.dialog = Dialog::Replace { tol: 24, scope: 0 };
                     }
                     if mi(ui, "Replace Primary with Secondary", "") {
                         self.filter_replace(false);
@@ -443,6 +516,18 @@ impl App {
                     ui.checkbox(&mut self.tile_preview, "Tiled Preview");
                     ui.checkbox(&mut self.sym_x, "Mirror Horizontally");
                     ui.checkbox(&mut self.sym_y, "Mirror Vertically");
+                    ui.separator();
+                    let mut light = self.th.light;
+                    if ui.selectable_label(!light, "Dark theme").clicked() {
+                        light = false;
+                    }
+                    if ui.selectable_label(light, "Light theme").clicked() {
+                        light = true;
+                    }
+                    if light != self.th.light {
+                        let c = ui.ctx().clone();
+                        self.set_light(&c, light);
+                    }
                 });
                 ui.menu_button("Help", |ui| {
                     if mi(ui, "Keyboard Shortcuts", "") {
@@ -499,6 +584,9 @@ impl App {
                     }
                     Tool::Select | Tool::Move => {
                         ui.label(RichText::new("Shift = add to selection").weak().small());
+                    }
+                    Tool::Lasso => {
+                        ui.label(RichText::new("Drag to draw a free-form selection. Shift = add to selection.").weak().small());
                     }
                     Tool::Picker => {
                         ui.label(RichText::new("Right-click = secondary color. Alt+click works with any tool.").weak().small());
@@ -557,9 +645,9 @@ impl App {
                 for &(t, name, key) in TOOLS {
                     let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     let sel = self.tool == t;
-                    let bg = if sel { ACCENT } else if resp.hovered() { Color32::from_rgb(70, 70, 76) } else { Color32::TRANSPARENT };
+                    let bg = if sel { ACCENT } else if resp.hovered() { self.th.btn_hover } else { Color32::TRANSPARENT };
                     ui.painter().rect_filled(rect, 6.0, bg);
-                    draw_icon(ui.painter(), rect, t, if sel { Color32::WHITE } else { Color32::from_gray(205) });
+                    draw_icon(ui.painter(), rect, t, if sel { Color32::WHITE } else { self.th.text });
                     if resp.on_hover_text(format!("{name} ({key})")).clicked() {
                         self.tool = t;
                     }
@@ -588,6 +676,7 @@ impl App {
                 egui::CollapsingHeader::new(RichText::new("Preview").strong()).default_open(true).show(ui, |ui| self.preview_ui(ui));
                 egui::CollapsingHeader::new(RichText::new("Color").strong()).default_open(true).show(ui, |ui| self.color_ui(ui));
                 egui::CollapsingHeader::new(RichText::new("Swatches").strong()).default_open(true).show(ui, |ui| self.swatches_ui(ui));
+                egui::CollapsingHeader::new(RichText::new("Project colors").strong()).default_open(false).show(ui, |ui| self.project_colors_ui(ui));
                 egui::CollapsingHeader::new(RichText::new("Layers").strong()).default_open(true).show(ui, |ui| self.layers_ui(ui));
             });
         });
@@ -604,7 +693,7 @@ impl App {
         let size = vec2(w * tiles * s, h * tiles * s);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), size.y.max(40.0)), Sense::hover());
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, 4.0, Color32::from_rgb(28, 28, 30));
+        p.rect_filled(rect, 4.0, self.th.well);
         let origin = rect.center() - size / 2.0;
         for ty in 0..tiles as i32 {
             for tx in 0..tiles as i32 {
@@ -675,7 +764,7 @@ impl App {
                     let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     ui.painter().rect_filled(rect, 2.0, c);
                     let sel = c == self.color;
-                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { Color32::WHITE } else { Color32::from_black_alpha(120) }));
+                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { self.th.strong } else { Color32::from_black_alpha(120) }));
                     let [r, g, b, _] = px_of(c);
                     let resp = resp.on_hover_text(format!("#{r:02X}{g:02X}{b:02X}  (right-click: secondary)"));
                     if resp.clicked() {
@@ -696,13 +785,64 @@ impl App {
         }
     }
 
+    fn project_colors_ui(&mut self, ui: &mut Ui) {
+        if self.colors_dirty && self.stroke.is_none() {
+            self.refresh_project_colors();
+        }
+        ui.label(RichText::new(format!("{} colors in this project", self.project_colors.len())).small().color(self.th.dim));
+        ui.label(RichText::new("Click: primary. Right-click for more (select pixels, replace, add to palette).").small().weak());
+        let mut act: Option<(Px, u8)> = None;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            ui.horizontal_wrapped(|ui| {
+                for (c, n) in self.project_colors.iter().take(300) {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                    ui.painter().rect_filled(rect, 2.0, color_of(*c));
+                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_black_alpha(110)));
+                    let resp = resp.on_hover_text(format!("#{:02X}{:02X}{:02X}  -  {} px", c[0], c[1], c[2], n));
+                    if resp.clicked() {
+                        act = Some((*c, 0));
+                    }
+                    resp.context_menu(|ui| {
+                        for (label, code) in [("Set as primary", 0u8), ("Set as secondary", 1), ("Select these pixels (layer)", 2), ("Select these pixels (flattened frame)", 3), ("Add to palette", 4), ("Replace with secondary (layer)", 5)] {
+                            if ui.button(label).clicked() {
+                                act = Some((*c, code));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        if let Some((c, code)) = act {
+            match code {
+                0 => self.color = color_of(c),
+                1 => self.color2 = color_of(c),
+                2 => self.select_color(c, 0, false),
+                3 => self.select_color(c, 0, true),
+                4 => {
+                    if !self.palette.contains(&color_of(c)) {
+                        self.palette.push(color_of(c));
+                    }
+                }
+                _ => {
+                    let (a, b) = (self.color, self.color2);
+                    self.color = color_of(c);
+                    self.fx_replace(0, 0);
+                    self.color = a;
+                    self.color2 = b;
+                }
+            }
+        }
+    }
+
     fn layers_ui(&mut self, ui: &mut Ui) {
         let n = self.doc.layers.len();
         for idx in (0..n).rev() {
             ui.horizontal(|ui| {
                 let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
                 let vis = self.doc.layers[idx].visible;
-                eye_icon(ui.painter(), r, vis, if vis { Color32::WHITE } else { Color32::GRAY });
+                eye_icon(ui.painter(), r, vis, if vis { self.th.strong } else { Color32::GRAY });
                 if resp.on_hover_text("Toggle visibility").clicked() {
                     self.doc.layers[idx].visible = !vis;
                     self.changed_all();
@@ -772,7 +912,7 @@ impl App {
                     self.goto_frame(-1);
                 }
                 let label = if self.playing { "Stop" } else { "Play" };
-                if ui.add(egui::Button::new(label).fill(if self.playing { ACCENT } else { Color32::from_rgb(62, 62, 66) })).clicked() {
+                if ui.add(egui::Button::new(label).fill(if self.playing { ACCENT } else { ui.visuals().widgets.inactive.bg_fill })).clicked() {
                     let c = ui.ctx().clone();
                     self.toggle_play(&c);
                 }
@@ -807,23 +947,33 @@ impl App {
             });
             ui.separator();
             ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+                let strip_y = ui.cursor().min.y;
+                ui.add_space(20.0);
+                let mut cell_rects: Vec<Rect> = vec![];
                 ui.horizontal(|ui| {
                     let (w, h) = (self.doc.w as f32, self.doc.h as f32);
                     for i in 0..self.doc.frames.len() {
                         let (rect, resp) = ui.allocate_exact_size(vec2(66.0, 74.0), Sense::click());
+                        cell_rects.push(rect);
                         let sel = i == self.cur_frame;
                         let p = ui.painter();
-                        p.rect_filled(rect, 4.0, if sel { Color32::from_rgb(30, 80, 150) } else { Color32::from_rgb(50, 50, 54) });
+                        p.rect_filled(rect, 4.0, if sel { Color32::from_rgb(30, 80, 150) } else { self.th.cell });
                         let area = Rect::from_min_size(rect.min + vec2(5.0, 4.0), vec2(56.0, 50.0));
-                        p.rect_filled(area, 2.0, Color32::from_rgb(24, 24, 26));
+                        p.rect_filled(area, 2.0, self.th.well);
                         let s = (area.width() / w).min(area.height() / h);
                         let ir = Rect::from_center_size(area.center(), vec2(w * s, h * s));
                         if let Some(Some(t)) = self.thumbs.get(i) {
                             p.image(t.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                         }
                         let hold = self.doc.holds[i];
-                        let txt = if hold > 1 { format!("{}  x{}", i + 1, hold) } else { format!("{}", i + 1) };
-                        p.text(pos2(rect.center().x, rect.bottom() - 9.0), Align2::CENTER_CENTER, txt, FontId::proportional(11.0), Color32::from_gray(210));
+                        let nm: String = self.doc.names[i].chars().take(7).collect();
+                        let txt = match (hold > 1, nm.is_empty()) {
+                            (true, true) => format!("{}  x{}", i + 1, hold),
+                            (true, false) => format!("{} {} x{}", i + 1, nm, hold),
+                            (false, true) => format!("{}", i + 1),
+                            (false, false) => format!("{} {}", i + 1, nm),
+                        };
+                        p.text(pos2(rect.center().x, rect.bottom() - 9.0), Align2::CENTER_CENTER, txt, FontId::proportional(11.0), if sel { Color32::WHITE } else { self.th.text });
                         if self.playing && i == self.play_frame {
                             p.rect_stroke(rect, 4.0, Stroke::new(2.0, Color32::from_rgb(120, 220, 140)));
                         } else if sel {
@@ -871,6 +1021,15 @@ impl App {
                                 self.hold_adjust(-1);
                             }
                             ui.separator();
+                            if ui.button("Rename Frame...").clicked() {
+                                self.dialog = Dialog::RenameFrame(self.doc.names[self.cur_frame].clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("New Tag Starting Here...").clicked() {
+                                self.dialog = start::dlg_new_tag(self);
+                                ui.close_menu();
+                            }
+                            ui.separator();
                             if ui.button("Reverse All Frames").clicked() {
                                 self.frame_reverse();
                                 ui.close_menu();
@@ -888,13 +1047,64 @@ impl App {
                         });
                     }
                 });
+                self.draw_tags(ui, &cell_rects, strip_y);
             });
         });
     }
 
+    fn draw_tags(&mut self, ui: &mut Ui, cells: &[Rect], strip_y: f32) {
+        let tags = self.doc.tags.clone();
+        for (ti, t) in tags.iter().enumerate() {
+            let (Some(r0), Some(r1)) = (cells.get(t.from), cells.get(t.to)) else { continue };
+            let rect = Rect::from_min_max(pos2(r0.min.x, strip_y + 2.0), pos2(r1.max.x, strip_y + 18.0));
+            let resp = ui.interact(rect, egui::Id::new(("tag", ti)), Sense::click());
+            let col = App::tag_color(t);
+            let p = ui.painter();
+            p.rect_filled(rect, 3.0, col.gamma_multiply(if resp.hovered() { 1.0 } else { 0.8 }));
+            if self.play_tag == Some(ti) {
+                p.rect_stroke(rect, 3.0, Stroke::new(2.0, self.th.strong));
+            }
+            let arrow = match t.dir {
+                TagDir::Forward => "",
+                TagDir::Reverse => " <",
+                TagDir::PingPong => " <>",
+            };
+            ui.painter_at(rect).text(rect.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, format!("{}{}", t.name, arrow), FontId::proportional(11.5), Color32::WHITE);
+            let resp = resp.on_hover_text("Click: play only this tag. Double-click: edit. Right-click: more.");
+            if resp.clicked() {
+                self.play_tag = if self.play_tag == Some(ti) { None } else { Some(ti) };
+                self.status = match self.play_tag {
+                    Some(_) => format!("Playback limited to tag \"{}\"", t.name),
+                    None => "Playing all frames".into(),
+                };
+            }
+            if resp.double_clicked() {
+                self.dialog = Dialog::Tag { idx: Some(ti), name: t.name.clone(), from: t.from, to: t.to, dir: t.dir as usize, color: t.color };
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Edit Tag...").clicked() {
+                    self.dialog = Dialog::Tag { idx: Some(ti), name: t.name.clone(), from: t.from, to: t.to, dir: t.dir as usize, color: t.color };
+                    ui.close_menu();
+                }
+                if ui.button("Delete Tag").clicked() {
+                    self.tag_delete(ti);
+                    ui.close_menu();
+                }
+                if ui.button("Play Only This Tag").clicked() {
+                    self.play_tag = Some(ti);
+                    ui.close_menu();
+                }
+                if ui.button("Play All Frames").clicked() {
+                    self.play_tag = None;
+                    ui.close_menu();
+                }
+            });
+        }
+    }
+
     // ------------------------------------------------------------ canvas
     fn canvas_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(Frame::none().fill(Color32::from_rgb(34, 34, 36))).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(Frame::none().fill(self.th.workspace)).show(ctx, |ui| {
             self.tab_bar(ui);
             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
             let full = ui.available_rect_before_wrap();
@@ -1022,7 +1232,7 @@ impl App {
             painter.rect_filled(crect.translate(vec2(4.0, 4.0)), 0.0, Color32::from_black_alpha(70));
             let vis = crect.intersect(area);
             if vis.is_positive() {
-                painter.rect_filled(vis, 0.0, Color32::from_gray(58));
+                painter.rect_filled(vis, 0.0, Color32::from_gray(if self.th.light { 196 } else { 58 }));
                 let sq = 12.0;
                 let (i0, i1) = (((vis.min.x - org.x) / sq).floor() as i32, ((vis.max.x - org.x) / sq).ceil() as i32);
                 let (j0, j1) = (((vis.min.y - org.y) / sq).floor() as i32, ((vis.max.y - org.y) / sq).ceil() as i32);
@@ -1033,7 +1243,7 @@ impl App {
                         }
                         let r = Rect::from_min_size(org + vec2(i as f32 * sq, j as f32 * sq), vec2(sq, sq)).intersect(vis);
                         if r.is_positive() {
-                            painter.rect_filled(r, 0.0, Color32::from_gray(72));
+                            painter.rect_filled(r, 0.0, Color32::from_gray(if self.th.light { 222 } else { 72 }));
                         }
                     }
                 }
@@ -1042,7 +1252,7 @@ impl App {
                 painter.image(t.id(), crect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
             if self.grid && z >= 6.0 {
-                let gc = Color32::from_rgba_unmultiplied(255, 255, 255, 16);
+                let gc = if self.th.light { Color32::from_rgba_unmultiplied(0, 0, 0, 22) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 16) };
                 for x in 0..=self.doc.w {
                     let sx = org.x + x as f32 * z;
                     painter.line_segment([pos2(sx, org.y), pos2(sx, org.y + size.y)], Stroke::new(1.0, gc));
@@ -1095,6 +1305,13 @@ impl App {
                 painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha(170));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90)));
             }
+            if let Some(st) = &self.stroke {
+                if st.tool == Tool::Lasso && st.pts.len() > 1 {
+                    let path: Vec<Pos2> = st.pts.iter().map(|&(x, y)| org + vec2(x as f32 + 0.5, y as f32 + 0.5) * z).collect();
+                    painter.add(egui::Shape::line(path.clone(), Stroke::new(3.0, Color32::BLACK)));
+                    painter.add(egui::Shape::line(path, Stroke::new(1.5, Color32::WHITE)));
+                }
+            }
             // brush cursor
             if let (Some((hx, hy)), false) = (self.hover, self.panning || hand) {
                 let sized = matches!(self.tool, Tool::Pencil | Tool::Eraser | Tool::Shade | Tool::Spray | Tool::Line | Tool::Rect | Tool::Ellipse);
@@ -1108,8 +1325,8 @@ impl App {
             // rulers
             if self.rulers {
                 let rp = ui.painter_at(full);
-                let rc = Color32::from_rgb(46, 46, 50);
-                let tc = Color32::from_gray(170);
+                let rc = self.th.ruler;
+                let tc = self.th.dim;
                 rp.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, full.min.y + ruler)), 0.0, rc);
                 rp.rect_filled(Rect::from_min_max(full.min, pos2(full.min.x + ruler, full.max.y)), 0.0, rc);
                 let mut step = 1usize;
@@ -1144,6 +1361,8 @@ impl App {
         let ctx = ui.ctx().clone();
         let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let (name, modified) = self.tab_title(self.active);
+        let th = self.th;
+        let home_only = self.placeholder_only();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             if caption_button(ui, 3) {
@@ -1157,7 +1376,7 @@ impl App {
             }
             let w = ui.available_width();
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click_and_drag());
-            ui.painter_at(rect).text(rect.center(), Align2::CENTER_CENTER, format!("{name}{} - SpriteCraft", if modified { " *" } else { "" }), FontId::proportional(12.0), Color32::from_gray(150));
+            ui.painter_at(rect).text(rect.center(), Align2::CENTER_CENTER, if home_only { "SpriteCraft".to_string() } else { format!("{name}{} - SpriteCraft", if modified { " *" } else { "" }) }, FontId::proportional(12.0), th.dim);
             if resp.double_clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
             } else if resp.drag_started() {
@@ -1171,7 +1390,7 @@ impl App {
         let s = ctx.screen_rect();
         if !maxed {
             ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("winborder")))
-                .rect_stroke(s.shrink(0.5), 0.0, Stroke::new(1.0, Color32::from_rgb(86, 86, 92)));
+                .rect_stroke(s.shrink(0.5), 0.0, Stroke::new(1.0, self.th.border));
             use egui::{CursorIcon as C, ResizeDirection as D};
             let (g, c) = (5.0, 14.0);
             let regions = [
@@ -1207,51 +1426,74 @@ impl App {
         }
     }
 
-    fn tab_bar(&mut self, ui: &mut Ui) {
+    pub fn tab_bar(&mut self, ui: &mut Ui) {
+        let th = self.th;
         let mut switch = None;
         let mut close = None;
         let mut newtab = false;
+        let mut home = false;
+        let hide_docs = self.placeholder_only();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(4.0);
-            for i in 0..self.tabs.len() {
-                let (name, modified) = self.tab_title(i);
-                let sel = i == self.active;
-                let label = format!("{name}{}", if modified { " *" } else { "" });
-                let col = if sel { Color32::WHITE } else { Color32::from_gray(170) };
-                let galley = ui.painter().layout_no_wrap(label, FontId::proportional(13.0), col);
-                let size = vec2(galley.size().x + 40.0, 28.0);
-                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+            {
+                let sel = self.show_home;
+                let col = if sel { th.strong } else { th.dim };
+                let galley = ui.painter().layout_no_wrap("Home".into(), FontId::proportional(13.0), col);
+                let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 30.0, 28.0), Sense::click());
                 let p = ui.painter();
-                let bg = if sel { Color32::from_rgb(52, 52, 56) } else if resp.hovered() { Color32::from_rgb(44, 44, 47) } else { Color32::from_rgb(36, 36, 38) };
-                p.rect_filled(rect, 0.0, bg);
+                p.rect_filled(rect, 0.0, if sel { th.tab_sel } else if resp.hovered() { th.tab_hover } else { th.tab });
                 if sel {
                     p.rect_filled(Rect::from_min_size(rect.min, vec2(rect.width(), 2.0)), 0.0, ACCENT);
                 }
-                p.galley(pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0), galley, col);
-                let xr = Rect::from_center_size(pos2(rect.max.x - 15.0, rect.center().y), vec2(18.0, 18.0));
-                let xresp = ui.interact(xr, ui.id().with(("tabx", i)), Sense::click());
-                if xresp.hovered() {
-                    ui.painter().rect_filled(xr, 3.0, Color32::from_rgb(90, 90, 96));
-                }
-                let c = xr.center();
-                let st = Stroke::new(1.3, Color32::from_gray(210));
-                ui.painter().line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
-                ui.painter().line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
-                if xresp.clicked() || resp.middle_clicked() {
-                    close = Some(i);
-                } else if resp.clicked() {
-                    switch = Some(i);
+                p.galley(pos2(rect.min.x + 15.0, rect.center().y - galley.size().y / 2.0), galley, col);
+                if resp.clicked() {
+                    home = true;
                 }
             }
-            if ui.add_sized([28.0, 28.0], egui::Button::new("+")).on_hover_text("New project tab").clicked() {
+            if !hide_docs {
+                for i in 0..self.tabs.len() {
+                    let (name, modified) = self.tab_title(i);
+                    let sel = i == self.active && !self.show_home;
+                    let label = format!("{name}{}", if modified { " *" } else { "" });
+                    let col = if sel { th.strong } else { th.dim };
+                    let galley = ui.painter().layout_no_wrap(label, FontId::proportional(13.0), col);
+                    let size = vec2(galley.size().x + 40.0, 28.0);
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    let p = ui.painter();
+                    let bg = if sel { th.tab_sel } else if resp.hovered() { th.tab_hover } else { th.tab };
+                    p.rect_filled(rect, 0.0, bg);
+                    if sel {
+                        p.rect_filled(Rect::from_min_size(rect.min, vec2(rect.width(), 2.0)), 0.0, ACCENT);
+                    }
+                    p.galley(pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0), galley, col);
+                    let xr = Rect::from_center_size(pos2(rect.max.x - 15.0, rect.center().y), vec2(18.0, 18.0));
+                    let xresp = ui.interact(xr, ui.id().with(("tabx", i)), Sense::click());
+                    if xresp.hovered() {
+                        ui.painter().rect_filled(xr, 3.0, th.btn_hover);
+                    }
+                    let c = xr.center();
+                    let st = Stroke::new(1.3, th.text);
+                    ui.painter().line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
+                    ui.painter().line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
+                    if xresp.clicked() || resp.middle_clicked() {
+                        close = Some(i);
+                    } else if resp.clicked() {
+                        switch = Some(i);
+                    }
+                }
+            }
+            if ui.add_sized([28.0, 28.0], egui::Button::new("+")).on_hover_text("New project").clicked() {
                 newtab = true;
             }
         });
-        if let Some(i) = close {
+        if home {
+            self.show_home = true;
+        } else if let Some(i) = close {
             self.request_close(i);
         } else if let Some(i) = switch {
             self.switch_tab(i);
+            self.show_home = false;
         } else if newtab {
             self.dialog = Dialog::New { w: 64, h: 64 };
         }
@@ -1261,10 +1503,10 @@ impl App {
 fn caption_button(ui: &mut Ui, kind: u8) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(46.0, 32.0), Sense::click());
     let hov = resp.hovered();
-    let bg = if hov { if kind == 3 { Color32::from_rgb(196, 43, 28) } else { Color32::from_rgb(63, 63, 67) } } else { Color32::TRANSPARENT };
+    let bg = if hov { if kind == 3 { Color32::from_rgb(196, 43, 28) } else { ui.visuals().widgets.hovered.bg_fill } } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, 0.0, bg);
     let c = pos2(rect.center().x.round() + 0.5, rect.center().y.round() + 0.5);
-    let st = Stroke::new(1.0, if hov && kind == 3 { Color32::WHITE } else { Color32::from_gray(225) });
+    let st = Stroke::new(1.0, if hov && kind == 3 { Color32::WHITE } else { ui.visuals().text_color() });
     let p = ui.painter();
     match kind {
         0 => {

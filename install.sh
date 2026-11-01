@@ -154,14 +154,15 @@ ensure_rust() {
   command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust from https://rustup.rs and re-run."
 }
 
-# rustup is required for cross-compilation targets
+# rustup is required for cross-compilation targets (distro-packaged cargo/rustc cannot add targets)
 ensure_rustup() {
-  ensure_rust
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
   if ! command -v rustup >/dev/null 2>&1; then
     log "Installing rustup (needed for cross-compilation targets)"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-    . "$HOME/.cargo/env"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+    export PATH="$HOME/.cargo/bin:$PATH"
   fi
+  command -v rustup >/dev/null 2>&1 || die "rustup not found. Install it from https://rustup.rs and re-run."
 }
 
 NATIVE_BUILT=0
@@ -352,9 +353,11 @@ build_windows_exe() { # leaves the exe at $WIN_EXE
       pkgs "mingw64-gcc mingw64-binutils" "gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64" "mingw-w64-gcc" "mingw64-cross-gcc mingw64-cross-binutils"
       command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || die "x86_64-w64-mingw32-gcc not found (install the mingw-w64 cross compiler)."
       ensure_rustup
-      rustup target add "$WIN_TARGET"
+      # Use rustup's own toolchain explicitly: a distro cargo earlier in PATH has no Windows std library.
+      log "Installing rustup stable toolchain with the $WIN_TARGET target"
+      rustup toolchain install stable --profile minimal --target "$WIN_TARGET"
       log "Cross-compiling for Windows ($WIN_TARGET)"
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc cargo build --release --target "$WIN_TARGET"
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc rustup run stable cargo build --release --target "$WIN_TARGET"
       WIN_EXE="$SRC_DIR/target/$WIN_TARGET/release/$APP.exe" ;;
     *) die "Windows builds need Linux (cross-compile) or Windows." ;;
   esac

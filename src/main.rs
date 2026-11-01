@@ -1,8 +1,13 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 mod app;
+mod config;
 mod dialogs;
 mod doc;
+mod effects;
+mod export;
+mod features;
 mod palettes;
+mod start;
 mod text;
 mod ui;
 
@@ -21,6 +26,7 @@ enum Tool {
     Rect,
     Ellipse,
     Select,
+    Lasso,
     Wand,
     Move,
     Shade,
@@ -38,6 +44,7 @@ const TOOLS: &[(Tool, &str, &str)] = &[
     (Tool::Rect, "Rectangle", "R"),
     (Tool::Ellipse, "Ellipse", "O"),
     (Tool::Select, "Rectangular Marquee", "M"),
+    (Tool::Lasso, "Lasso (free-form selection)", "Q"),
     (Tool::Wand, "Magic Wand", "W"),
     (Tool::Move, "Move", "V"),
     (Tool::Shade, "Lighten / Darken", "D"),
@@ -119,6 +126,74 @@ enum Dialog {
     Shortcuts,
     About,
     ConfirmClose(usize),
+    Effects { tab: usize, thick: usize, diag: bool, inner: bool, sdx: i32, sdy: i32, light: (i32, i32), depth: usize, strength: f32, hue: f32, all: bool },
+    RotSprite { angle: f32, all: bool },
+    Replace { tol: i32, scope: usize },
+    Tag { idx: Option<usize>, name: String, from: usize, to: usize, dir: usize, color: [u8; 3] },
+    RenameFrame(String),
+    Recover(Vec<config::Crashed>),
+    ConfirmQuit,
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    light: bool,
+    title: Color32,
+    workspace: Color32,
+    well: Color32,
+    tab: Color32,
+    tab_hover: Color32,
+    tab_sel: Color32,
+    cell: Color32,
+    ruler: Color32,
+    border: Color32,
+    btn_hover: Color32,
+    text: Color32,
+    strong: Color32,
+    dim: Color32,
+    card: Color32,
+}
+
+impl Theme {
+    fn new(light: bool) -> Theme {
+        if light {
+            Theme {
+                light,
+                title: Color32::from_rgb(236, 236, 238),
+                workspace: Color32::from_rgb(214, 214, 218),
+                well: Color32::from_rgb(200, 200, 205),
+                tab: Color32::from_rgb(222, 222, 226),
+                tab_hover: Color32::from_rgb(232, 232, 236),
+                tab_sel: Color32::from_rgb(248, 248, 250),
+                cell: Color32::from_rgb(226, 226, 230),
+                ruler: Color32::from_rgb(228, 228, 232),
+                border: Color32::from_rgb(150, 150, 158),
+                btn_hover: Color32::from_rgb(205, 205, 212),
+                text: Color32::from_gray(50),
+                strong: Color32::from_gray(15),
+                dim: Color32::from_gray(100),
+                card: Color32::from_rgb(244, 244, 247),
+            }
+        } else {
+            Theme {
+                light,
+                title: Color32::from_rgb(31, 31, 33),
+                workspace: Color32::from_rgb(34, 34, 36),
+                well: Color32::from_rgb(26, 26, 28),
+                tab: Color32::from_rgb(36, 36, 38),
+                tab_hover: Color32::from_rgb(44, 44, 47),
+                tab_sel: Color32::from_rgb(52, 52, 56),
+                cell: Color32::from_rgb(50, 50, 54),
+                ruler: Color32::from_rgb(46, 46, 50),
+                border: Color32::from_rgb(86, 86, 92),
+                btn_hover: Color32::from_rgb(70, 70, 76),
+                text: Color32::from_gray(205),
+                strong: Color32::WHITE,
+                dim: Color32::from_gray(150),
+                card: Color32::from_rgb(46, 46, 50),
+            }
+        }
+    }
 }
 
 struct App {
@@ -187,6 +262,21 @@ struct App {
     text_cache: Option<TextCache>,
     text_font: Option<(String, ab_glyph::FontVec)>,
     text_tex: Option<(String, TextureHandle)>,
+    th: Theme,
+    config: config::Config,
+    show_home: bool,
+    new_w: usize,
+    new_h: usize,
+    project_colors: Vec<(Px, usize)>,
+    colors_dirty: bool,
+    play_tag: Option<usize>,
+    play_pos: usize,
+    session: String,
+    last_autosave: f64,
+    palette_open: bool,
+    palette_query: String,
+    palette_sel: usize,
+    quit_ok: bool,
 }
 
 pub fn logo_rgba() -> Vec<u8> {
@@ -239,7 +329,36 @@ fn hex_color(h: u32) -> Color32 {
     Color32::from_rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
 }
 
-fn apply_theme(ctx: &egui::Context) {
+fn apply_theme(ctx: &egui::Context, light: bool) {
+    if light {
+        let mut v = egui::Visuals::light();
+        v.panel_fill = Color32::from_rgb(238, 238, 241);
+        v.window_fill = Color32::from_rgb(246, 246, 249);
+        v.extreme_bg_color = Color32::from_rgb(252, 252, 253);
+        v.faint_bg_color = Color32::from_rgb(230, 230, 234);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(222, 222, 228);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(222, 222, 228);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(206, 206, 214);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(206, 206, 214);
+        v.widgets.active.weak_bg_fill = Color32::from_rgb(38, 120, 220);
+        v.widgets.active.bg_fill = Color32::from_rgb(38, 120, 220);
+        v.selection.bg_fill = Color32::from_rgb(38, 120, 220);
+        v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+        let r = egui::Rounding::same(4.0);
+        v.widgets.noninteractive.rounding = r;
+        v.widgets.inactive.rounding = r;
+        v.widgets.hovered.rounding = r;
+        v.widgets.active.rounding = r;
+        v.widgets.open.rounding = r;
+        v.window_rounding = egui::Rounding::same(8.0);
+        v.menu_rounding = egui::Rounding::same(6.0);
+        ctx.set_visuals(v);
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = vec2(6.0, 4.0);
+            s.spacing.button_padding = vec2(8.0, 3.0);
+        });
+        return;
+    }
     let mut v = egui::Visuals::dark();
     v.panel_fill = Color32::from_rgb(40, 40, 42);
     v.window_fill = Color32::from_rgb(48, 48, 50);
@@ -318,6 +437,12 @@ fn draw_icon(p: &egui::Painter, r: Rect, tool: Tool, col: Color32) {
                     p.line_segment([pos2(x, b.y - 4.0 * u), pos2(x, b.y)], thin);
                 }
             }
+        }
+        Tool::Lasso => {
+            let pts: Vec<Pos2> = (0..28).map(|i| { let a = i as f32 / 28.0 * std::f32::consts::TAU; pt(a.cos() * 9.0, a.sin() * 6.0 - 2.0) }).collect();
+            p.add(egui::Shape::dashed_line(&{ let mut v = pts.clone(); v.push(pts[0]); v }, thin, 3.0 * u, 2.0 * u));
+            p.line_segment([pt(-6.0, 4.0), pt(-9.0, 10.0)], thin);
+            p.circle_stroke(pt(-9.5, 11.0), 1.8 * u, thin);
         }
         Tool::Wand => {
             p.line_segment([pt(-10.0, 10.0), pt(2.0, -2.0)], st);
